@@ -1,53 +1,54 @@
 # CloudLab
 
-A hybrid lab (on-premise + AWS) where I learn cloud, networking and security by building, breaking, investigating and documenting real environments.
+Un laboratorio híbrido (on-premise + AWS) donde aprendo cloud, networking y seguridad construyendo, rompiendo, investigando y documentando entornos reales.
 
-> 🚧 **Work in progress.** This README describes the goals and structure of the project. Content is being published environment by environment.
+> 🚧 **Trabajo en progreso.** Este README describe los objetivos y la estructura del proyecto. El contenido se va publicando entorno por entorno.
 
-## What it is
+## Qué es
 
-CloudLab is a personal lab built around one idea: virtual machines running on my own hardware (KVM) connected securely to infrastructure in AWS, so I can practice the way real hybrid environments work.
+CloudLab es un laboratorio personal construido alrededor de una idea: máquinas virtuales corriendo en mi propio hardware (KVM) conectadas de forma segura a infraestructura en AWS, para practicar cómo funcionan los entornos híbridos reales.
 
-Each use case is an **independent environment** in its own subdirectory, with its own documentation, so the lab can grow without turning into a single tangled project.
+Cada caso de uso es un **entorno independiente** en su propio subdirectorio, con su propia documentación, para que el laboratorio pueda crecer sin convertirse en un solo proyecto enredado.
 
-## Objectives
+## Objetivos
 
-- **Learn by doing.** Understand how larger systems work by starting small: first a network, then a service, then how they connect and how they are monitored.
-- **Hybrid connectivity.** Connect on-premise VMs with an AWS VPC through a WireGuard tunnel started from the local side, with no inbound ports exposed.
-- **Infrastructure as code.** Define the AWS side with CloudFormation so every environment can be deployed, destroyed and redeployed reproducibly.
-- **Security from both sides.** Practice red team and blue team in a controlled environment, with monitoring, detection and a written report for each exercise.
-- **Document everything.** Every environment records not only what worked, but the decisions, the problems found and how they were solved.
-- **Share reusable templates.** Publish the templates so others can replicate the environments, with a static web portfolio planned to present them.
+- **Aprender haciendo.** Entender cómo funcionan sistemas más grandes empezando de a poco: primero una red, luego un servicio, luego cómo se conectan y cómo se monitorean.
+- **Conectividad híbrida.** Conectar VMs on-premise con una VPC de AWS a través de un túnel WireGuard iniciado desde el lado local, sin exponer puertos entrantes.
+- **Infraestructura como código.** Definir el lado de AWS con CloudFormation para que cada entorno pueda desplegarse, destruirse y volver a desplegarse de forma reproducible.
+- **Seguridad desde ambos lados.** Practicar red team y blue team en un entorno controlado, con monitoreo, detección y un reporte escrito para cada ejercicio.
+- **Documentar todo.** Cada entorno registra no solo lo que funcionó, sino las decisiones, los problemas encontrados y cómo se resolvieron.
+- **Compartir plantillas reutilizables.** Publicar las plantillas para que otros puedan replicar los entornos, con un portfolio web estático planeado para presentarlos.
 
-## Architecture (high level)
+## Arquitectura (vista general)
 
 ```
-  LOCAL NETWORK (on-premise)                         AWS
+  RED LOCAL (on-premise)                              AWS
  +---------------------------+              +---------------------------+
- |  KVM host                 |              |  VPC                      |
- |   +-------+  +-------+    |   WireGuard  |   +--------------------+  |
- |   | VM    |  | VM    |    |   tunnel     |   | Tools / monitoring |  |
- |   +-------+  +-------+    |<============>|   +--------------------+  |
- |                           |  started     |   deployed with           |
- |  (no inbound ports open)  |  from local  |   CloudFormation          |
+ |  Host KVM                 |              |  VPC                      |
+ |   +-------+  +-------+    |   Túnel      |   +--------------------+  |
+ |   | VM    |  | VM    |    |   WireGuard  |   | Herramientas /     |  |
+ |   +-------+  +-------+    |<============>|   | monitoreo          |  |
+ |                           |  iniciado    |   +--------------------+  |
+ |  (sin puertos entrantes   |  desde local |   desplegado con           |
+ |   abiertos)               |              |   CloudFormation          |
  +---------------------------+              +---------------------------+
 ```
 
-## Environments
+## Entornos
 
-| Environment | Status | Description |
+| Entorno | Estado | Descripción |
 |---|---|---|
-| [`pentestlab/`](./pentestlab) | 🟡 In progress | Analysis of vulnerable VMs as red team and blue team, with a monitoring stack in AWS connected to the on-premise VMs. |
-| More environments | 🔜 Planned | They will be added as independent subdirectories as they are ready. |
+| [`pentestlab/`](./pentestlab) | 🟡 En progreso | Análisis de VMs vulnerables como red team y blue team, con un stack de monitoreo en AWS conectado a las VMs on-premise. |
+| Más entornos | 🔜 Planeados | Se irán agregando como subdirectorios independientes a medida que estén listos. |
 
-### PentestLab status
+### Estado de PentestLab
 
-- ✅ Mr. Robot: full analysis published
-- 🔄 Vulnerability analysis with Nessus
-- 🔄 Final report
-- 🔄 Purple-team approach: cross what the attack sees with what the monitoring detects
+- ✅ Mr. Robot: análisis completo publicado
+- 🔄 Análisis de vulnerabilidades con Nessus
+- 🔄 Reporte final
+- 🔄 Enfoque purple-team: cruzar lo que ve el ataque con lo que detecta el monitoreo
 
-## Repository structure
+## Estructura del repositorio
 
 ```
 Cloudlab/
@@ -55,14 +56,14 @@ Cloudlab/
 └── pentestlab/
 ```
 
-More subdirectories will be added with each new environment.
+Se irán agregando más subdirectorios con cada nuevo entorno.
 
-## Principles
+## Principios
 
-- Everything is deployed in a controlled environment I own.
-- Each exercise is documented with its reasoning, not just its result.
-- Nothing is published as finished until it is.
+- Todo se despliega en un entorno controlado que me pertenece.
+- Cada ejercicio se documenta con su razonamiento, no solo con su resultado.
+- Nada se publica como terminado hasta que lo esté.
 
-## Author
+## Autor
 
 Diego Vásquez · [GitHub](https://github.com/dvasquez-design) · [LinkedIn](https://linkedin.com/in/diego-vasquez-cloud)
