@@ -38,7 +38,8 @@ Cada caso de uso es un **entorno independiente** en su propio subdirectorio, con
 
 | Entorno | Estado | Descripción |
 |---|---|---|
-| [`pentestlab/`](./pentestlab) | 🟡 En progreso | Análisis de VMs vulnerables como red team y blue team, con un stack de monitoreo en AWS conectado a las VMs on-premise. |
+| [`PentestLab/`](./PentestLab) | 🟡 En progreso | Análisis de VMs vulnerables como red team y blue team, con un stack de monitoreo en AWS conectado a las VMs on-premise. |
+| [`Active-Directory-Hibrido/`](./Active-Directory-Hibrido) | 🟡 En progreso (Nivel 1 completo) | Dominio de Active Directory on-premise (Windows Server 2022 en KVM) extendido a AWS por WireGuard: clientes Ubuntu unidos al dominio por departamento, shares Samba, tráfico simulado y tickets de soporte N1. |
 | Más entornos | 🔜 Planeados | Se irán agregando como subdirectorios independientes a medida que estén listos. |
 
 ### Estado de PentestLab
@@ -48,12 +49,35 @@ Cada caso de uso es un **entorno independiente** en su propio subdirectorio, con
 - 🔄 Reporte final
 - 🔄 Enfoque purple-team: cruzar lo que ve el ataque con lo que detecta el monitoreo
 
+### Estado de Active-Directory-Hibrido
+
+**Nivel 1 (completo)**
+
+- ✅ Controlador de dominio `corp.wonderland.local` on-premise, con OUs, usuarios y grupos por departamento
+- ✅ Túnel WireGuard entre el host KVM y un gateway en AWS, desplegado con CloudFormation
+- ✅ 4 clientes Ubuntu en AWS unidos al dominio, uno por departamento (IT, Ventas, RRHH, Gerencia), con acceso controlado por grupo
+- ✅ Shares Samba por departamento con rechazo cruzado verificado
+- ✅ Tráfico de autenticación simulado y capturado
+- ✅ 5 tickets de soporte N1 resueltos y documentados
+
+**Próxima versión (Nivel 2, planificado)**
+
+- 🔜 Segundo controlador de dominio (réplica) en AWS, con Sites and Services para el sitio on-premise y el sitio AWS
+- 🔜 DNS híbrido nativo con Route 53 Resolver, sin configurar el DNS a mano en cada cliente
+- 🔜 Políticas de contraseña diferenciadas por OU (Fine-Grained Password Policies)
+- 🔜 LAPS: contraseña de administrador local rotativa
+- 🔜 Hardening: SMBv1 deshabilitado y auditoría de NTLM
+- 🔜 Auditoría avanzada de eventos de Windows y VPC Flow Logs
+- 🔜 5 escenarios de troubleshooting N2/N3 con evidencia
+- 🔜 Monitoreo del entorno (fuera del alcance del Nivel 1)
+
 ## Estructura del repositorio
 
 ```
 Cloudlab/
 ├── README.md
-└── pentestlab/
+├── PentestLab/
+└── Active-Directory-Hibrido/
 ```
 
 Se irán agregando más subdirectorios con cada nuevo entorno.
