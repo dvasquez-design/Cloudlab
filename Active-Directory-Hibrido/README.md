@@ -25,9 +25,7 @@ Simula una empresa pequeña con oficina on-premise y una sucursal en la nube:
 
 ## Arquitectura
 
-![Diagrama de arquitectura (plan original)](./01-diagrama-arquitectura.jpg)
-
-> El diagrama es el **plan original**. La versión final difiere en detalles: por ejemplo, el modelo `ubu-model` se reemplazó por cuatro clones lanzados desde Ubuntu 24.04 con *user data*, porque el sandbox de AWS no permite lanzar instancias desde AMIs propias.
+![Diagrama de arquitectura](./01-diagrama-arquitectura.jpg)
 
 ```
   ON-PREMISE (host KVM)                                AWS (VPC 10.0.0.0/16)
@@ -126,7 +124,7 @@ Active-Directory-Hibrido/
 |---|---|
 | [`ad-hybrid-lab-documento-v1.md`](./ad-hybrid-lab-documento-v1.md) | Bitácora completa: decisiones, comandos exactos, 30 errores con causa raíz, scripts, tickets N1 y pasos para reconstruir |
 | [`hybrid-ad-lab-network.yaml`](./hybrid-ad-lab-network.yaml) | Plantilla de CloudFormation: red, gateway WireGuard y, opcionalmente, los 4 clientes Ubuntu |
-| `01-diagrama-arquitectura.jpg` | Diagrama del plan original |
+| `01-diagrama-arquitectura.jpg` | Diagrama de arquitectura |
 
 ## Cómo replicarlo
 
