@@ -62,13 +62,12 @@ Cada caso de uso es un **entorno independiente** en su propio subdirectorio, con
 
 **Próxima versión (Nivel 2, planificado)**
 
-- 🔜 Segundo controlador de dominio (réplica) en AWS, con Sites and Services para el sitio on-premise y el sitio AWS
 - 🔜 DNS híbrido nativo con Route 53 Resolver, sin configurar el DNS a mano en cada cliente
 - 🔜 Políticas de contraseña diferenciadas por OU (Fine-Grained Password Policies)
 - 🔜 LAPS: contraseña de administrador local rotativa
 - 🔜 Hardening: SMBv1 deshabilitado y auditoría de NTLM
 - 🔜 Auditoría avanzada de eventos de Windows y VPC Flow Logs
-- 🔜 5 escenarios de troubleshooting N2/N3 con evidencia
+- 🔜 Escenarios de troubleshooting N2/N3 con evidencia
 - 🔜 Monitoreo del entorno (fuera del alcance del Nivel 1)
 
 ## Estructura del repositorio
