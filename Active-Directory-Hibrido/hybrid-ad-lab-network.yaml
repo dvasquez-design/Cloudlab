@@ -1,0 +1,977 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab Hibrido AD - Infraestructura empresarial en AWS (Nivel 1) - v3.
+  VPC + subnet publica (gateway WAN) + subnet privada (gateway LAN + clientes
+  Ubuntu del dominio) + Security Groups. Gateway Amazon Linux con dos ENIs que
+  termina el tunel WireGuard y filtra con iptables. Cambios v2 respecto a v1:
+  (1) peer con /32 del tunel, (2) ruta default de la subnet privada via gateway,
+  (3) ICMP desde on-prem y tunel en el SG privado, (4) deteccion dinamica de
+  interfaces WAN/LAN en UserData. Cambios v3 (validados en el lab real):
+  (5) 4 clientes Ubuntu 24.04 opcionales (DeployClients) con user data que
+  instala realmd/sssd/samba y deja dept-config.sh listo (join por Samba, DNS
+  solo DC); sin AMI propia porque el sandbox bloquea RunInstances con AMIs
+  custom. LabInstanceProfile se sigue asignando a mano + reboot.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.0.0/24
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  OnPremCidr:
+    Type: String
+    Default: 192.168.50.0/24
+    Description: Red libvirt del lab on-prem (Wonderland), alcanzable via el tunel
+
+  TunnelCidr:
+    Type: String
+    Default: 10.91.0.0/24
+    Description: Rango del tunel hybrid (distinto de 10.90.0.0/24 PentestLab y 10.92.0.0/24 Azure)
+
+  WireGuardPort:
+    Type: Number
+    Default: 51820
+
+  ExistingInstanceProfileName:
+    Type: String
+    Default: ""
+    Description: >
+      Dejar vacio: CloudFormation no tiene iam:PassRole en este sandbox.
+      LabInstanceProfile se asigna despues, manual (EC2 > Actions > Security >
+      Modify IAM role) + reboot.
+
+  KeyName:
+    Type: String
+    Default: AD
+    Description: >
+      Nombre del key pair en EC2 (sin .pem: AD.pem -> AD). Debe existir en la
+      region antes del deploy. Vacio = solo SSM. El SSH al gateway y a los
+      clientes va por el tunel, no hay puerto 22 publico.
+
+  GatewayInstanceType:
+    Type: String
+    Default: t3.micro
+
+  GatewayAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  WgClientPublicKey:
+    Type: String
+    Description: >
+      Clave publica de Wonderland (hybrid_client_public.key). Sin Default a
+      proposito, se pasa siempre explicita. La clave del server se genera en
+      el primer boot del gateway, no es parametro.
+
+  WgServerAddress:
+    Type: String
+    Default: 10.91.0.1/24
+    Description: IP del gateway dentro del tunel
+
+  WgClientTunnelIp:
+    Type: String
+    Default: 10.91.0.2/32
+    Description: IP de Wonderland dentro del tunel (/32, necesario en AllowedIPs del peer)
+
+  DeployClients:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      "false" = solo red + gateway (como v2). "true" = ademas lanza los 4
+      clientes Ubuntu. Recomendado: desplegar primero en false, verificar tunel y
+      DC, y recien despues actualizar el stack a true (los clientes necesitan
+      internet via gateway y resolver el DC por el tunel).
+
+  ClientAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+  ClientInstanceType:
+    Type: String
+    Default: t3.micro
+
+  ItClientIp:
+    Type: String
+    Default: 10.0.1.11
+  VentasClientIp:
+    Type: String
+    Default: 10.0.1.12
+  RrhhClientIp:
+    Type: String
+    Default: 10.0.1.13
+  GerenciaClientIp:
+    Type: String
+    Default: 10.0.1.14
+
+Conditions:
+  HasInstanceProfile: !Not [!Equals [!Ref ExistingInstanceProfileName, ""]]
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+  CreateClients: !Equals [!Ref DeployClients, "true"]
+
+Resources:
+
+  ## --- Red base ---
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-public
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-private
+
+  ## --- Ruteo ---
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-private-rt
+
+  PrivateRouteToOnPrem:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayInstance
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: !Ref OnPremCidr
+      NetworkInterfaceId: !Ref GatewayLanNetworkInterface
+
+  # v2: salida a internet (apt, SSM) de los clientes via gateway (MASQUERADE por WAN).
+  # Tambien cubre el retorno hacia el rango del tunel si algun origen llega NATeado.
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayInstance
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NetworkInterfaceId: !Ref GatewayLanNetworkInterface
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  ## --- Security Groups ---
+
+  GatewayWanSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG de la interfaz WAN del gateway - unico recurso expuesto a internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: !Ref WireGuardPort
+          ToPort: !Ref WireGuardPort
+          CidrIp: 0.0.0.0/0
+          Description: WireGuard - origen 0.0.0.0/0 porque el peer on-prem esta detras de CGNAT
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-gateway-wan-sg
+
+  PrivateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG de la interfaz LAN del gateway + clientes Ubuntu (realmd/sssd + Samba)
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref OnPremCidr
+          Description: DNS TCP desde on-prem
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref OnPremCidr
+          Description: DNS UDP desde on-prem
+        - IpProtocol: tcp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Ref OnPremCidr
+          Description: Kerberos TCP desde on-prem
+        - IpProtocol: udp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Ref OnPremCidr
+          Description: Kerberos UDP desde on-prem
+        - IpProtocol: tcp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Ref OnPremCidr
+          Description: LDAP desde on-prem
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: !Ref OnPremCidr
+          Description: SMB desde on-prem (shares via Samba)
+        - IpProtocol: tcp
+          FromPort: 464
+          ToPort: 464
+          CidrIp: !Ref OnPremCidr
+          Description: kpasswd desde on-prem
+        - IpProtocol: udp
+          FromPort: 464
+          ToPort: 464
+          CidrIp: !Ref OnPremCidr
+          Description: kpasswd UDP desde on-prem
+        # SSH solo desde el host via tunel (Wonderland = 10.91.0.2), nunca publico
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref TunnelCidr
+          Description: SSH desde el rango del tunel
+        # v2: ICMP para verificacion por ping
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref OnPremCidr
+          Description: ICMP desde on-prem
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref TunnelCidr
+          Description: ICMP desde el rango del tunel (host Wonderland)
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-private-sg
+
+  PrivateSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref PrivateSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref PrivateSecurityGroup
+      Description: Trafico entre recursos de la propia subnet privada
+
+  ## --- Gateway: dos interfaces (WAN publica, LAN privada) ---
+
+  GatewayWanNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      GroupSet:
+        - !Ref GatewayWanSecurityGroup
+      SourceDestCheck: false
+      Description: WAN gateway - termina el tunel WireGuard
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-gateway-wan
+
+  GatewayLanNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      GroupSet:
+        - !Ref PrivateSecurityGroup
+      SourceDestCheck: false
+      Description: LAN gateway - filtra hacia la subnet privada
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-gateway-lan
+
+  GatewayInstance:
+    Type: AWS::EC2::Instance
+    # v3: el user data hace dnf install en el primer boot, asi que internet (ruta
+    # al IGW + EIP en la ENI WAN) debe existir ANTES de crear la instancia.
+    DependsOn: [PublicDefaultRoute, PublicSubnetRouteTableAssociation, GatewayWanEipAssociation]
+    Properties:
+      InstanceType: !Ref GatewayInstanceType
+      ImageId: !Ref GatewayAmiId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      IamInstanceProfile: !If [HasInstanceProfile, !Ref ExistingInstanceProfileName, !Ref "AWS::NoValue"]
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref GatewayWanNetworkInterface
+          DeviceIndex: 0
+        - NetworkInterfaceId: !Ref GatewayLanNetworkInterface
+          DeviceIndex: 1
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-gateway
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          exec > /var/log/user-data.log 2>&1
+
+          # v3: reintentos, por si la red tarda unos segundos en salir
+          for i in $(seq 1 20); do
+            dnf install -y wireguard-tools iptables-services && break
+            sleep 15
+          done
+          command -v wg || { echo "wireguard-tools no se instalo"; exit 1; }
+          systemctl enable iptables
+
+          sysctl -w net.ipv4.ip_forward=1
+          sysctl -w net.ipv4.conf.all.rp_filter=2
+          echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+          echo "net.ipv4.conf.all.rp_filter=2" >> /etc/sysctl.conf
+
+          # Esperar a que la segunda ENI (LAN) aparezca.
+          for i in $(seq 1 30); do
+            [ "$(ls /sys/class/net | grep -vE '^(lo|wg.*|docker.*)$' | wc -l)" -ge 2 ] && break
+            sleep 2
+          done
+
+          # WAN = interfaz con la ruta default; LAN = la otra interfaz fisica.
+          WAN_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+          LAN_IF=$(ls /sys/class/net | grep -vE '^(lo|wg.*|docker.*)$' | grep -vx "$WAN_IF" | head -1)
+          echo "WAN_IF=$WAN_IF LAN_IF=$LAN_IF" > /var/log/gateway-ifaces.log
+
+          # El par del server se genera ACA, en el primer boot: la private key
+          # no queda en el template ni en los parametros del stack.
+          mkdir -p /etc/wireguard
+          wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
+          chmod 600 /etc/wireguard/server_private.key
+          SERVER_PRIVATE_KEY=$(cat /etc/wireguard/server_private.key)
+
+          cat > /etc/wireguard/wg0.conf << WGEOF
+          [Interface]
+          PrivateKey = $SERVER_PRIVATE_KEY
+          Address = ${WgServerAddress}
+          ListenPort = ${WireGuardPort}
+
+          [Peer]
+          PublicKey = ${WgClientPublicKey}
+          AllowedIPs = ${WgClientTunnelIp}, ${OnPremCidr}
+          WGEOF
+          chmod 600 /etc/wireguard/wg0.conf
+          systemctl enable --now wg-quick@wg0
+
+          # Forwarding LAN <-> tunel, LAN -> internet (WAN) con NAT de salida.
+          iptables -A FORWARD -i $LAN_IF -o wg0 -j ACCEPT
+          iptables -A FORWARD -i wg0 -o $LAN_IF -j ACCEPT
+          iptables -A FORWARD -i $LAN_IF -o $WAN_IF -j ACCEPT
+          iptables -A FORWARD -i $WAN_IF -o $LAN_IF -m state --state RELATED,ESTABLISHED -j ACCEPT
+          iptables -t nat -A POSTROUTING -o $WAN_IF -j MASQUERADE
+
+          iptables-save > /etc/sysconfig/iptables
+
+  GatewayWanEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: hybrid-ad-lab-gateway-wan-eip
+
+  GatewayWanEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt GatewayWanEip.AllocationId
+      NetworkInterfaceId: !Ref GatewayWanNetworkInterface
+
+  ## --- Clientes Ubuntu (opcionales, DeployClients=true) ---
+  # LabInstanceProfile no va en CFN (sin iam:PassRole): asignarlo a mano + reboot.
+
+  ClientIt:
+    Type: AWS::EC2::Instance
+    Condition: CreateClients
+    DependsOn: [PrivateDefaultRoute, PrivateSubnetRouteTableAssociation]
+    Properties:
+      InstanceType: !Ref ClientInstanceType
+      ImageId: !Ref ClientAmiId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref PrivateSubnet
+      PrivateIpAddress: !Ref ItClientIp
+      SecurityGroupIds:
+        - !Ref PrivateSecurityGroup
+      CreditSpecification:
+        CPUCredits: unlimited
+      Tags:
+        - Key: Name
+          Value: ubu-it-01
+        - Key: Dept
+          Value: IT
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - ""
+            - - |
+                #!/bin/bash
+                exec > /var/log/user-data.log 2>&1
+                set -x
+                export DEBIAN_FRONTEND=noninteractive
+                for i in $(seq 1 30); do apt-get update -y && break; sleep 10; done
+                apt-get install -y realmd sssd sssd-tools sssd-ad adcli krb5-user samba samba-common-bin \
+                  oddjob oddjob-mkhomedir packagekit libnss-sss libpam-sss chrony dnsutils ldap-utils \
+                  smbclient cifs-utils netcat-openbsd
+                systemctl disable --now smbd nmbd || true
+                cat > /usr/local/bin/dept-config.sh << 'SCRIPT_EOF'
+                #!/bin/bash
+                # dept-config.sh v3 - Configura un clon por departamento y lo une a corp.wonderland.local
+                # Uso: sudo dept-config.sh [IT|Ventas|RRHH|Gerencia]
+                #   sin argumento: lee /etc/lab-dept, y si no existe, el tag Dept de IMDS
+                set -euo pipefail
+
+                DOMAIN="corp.wonderland.local"
+                BASE_DN="DC=corp,DC=wonderland,DC=local"
+                DC_IP="192.168.50.10"
+                JOIN_USER="${JOIN_USER:-Administrator}"
+
+                [ "$(id -u)" -eq 0 ] || { echo "Ejecutar con sudo"; exit 1; }
+
+                DEPT="${1:-}"
+                [ -z "$DEPT" ] && [ -s /etc/lab-dept ] && DEPT=$(cat /etc/lab-dept)
+                if [ -z "$DEPT" ]; then
+                  TOKEN=$(curl -s -m 5 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
+                  DEPT=$(curl -s -m 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Dept || true)
+                fi
+                case "$DEPT" in
+                  IT|Ventas|RRHH|Gerencia) ;;
+                  *) echo "Uso: sudo dept-config.sh <IT|Ventas|RRHH|Gerencia>"; exit 1 ;;
+                esac
+                DL="${DEPT,,}"
+                SHORT="ubu-${DL}-01"
+                FQDN="${SHORT}.${DOMAIN}"
+
+                echo "[1/6] Hostname: $FQDN"
+                hostnamectl set-hostname "$FQDN"
+                echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+                IP=$(hostname -I | awk '{print $1}')
+                sed -i "/ ${SHORT}\$/d" /etc/hosts
+                echo "$IP $FQDN $SHORT" >> /etc/hosts
+
+                echo "[2/6] DNS: solo el DC ($DC_IP); el resolver de la VPC no conoce el dominio"
+                IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+                cat > /etc/netplan/60-ad-dns.yaml << NETEOF
+                network:
+                  version: 2
+                  ethernets:
+                    $IFACE:
+                      dhcp4-overrides:
+                        use-dns: false
+                      nameservers:
+                        addresses: [$DC_IP]
+                        search: [$DOMAIN]
+                NETEOF
+                chmod 600 /etc/netplan/60-ad-dns.yaml
+                netplan generate || { rm -f /etc/netplan/60-ad-dns.yaml; echo "netplan invalido, archivo removido"; exit 1; }
+                resolvectl dns "$IFACE" "$DC_IP"
+                resolvectl domain "$IFACE" "$DOMAIN"
+
+                echo "[3/6] Descubrimiento del DC"
+                getent hosts "win-dc01.$DOMAIN" > /dev/null || { echo "No resuelve el DC por DNS (tunel caido o DC apagado?)"; exit 1; }
+                realm discover "$DOMAIN" | head -3
+
+                echo "[4/6] Join al dominio en OU=$DEPT (membresia Samba)"
+                if realm list 2>/dev/null | grep -q "domain-name: $DOMAIN"; then
+                  echo "Ya unido, se omite el join"
+                else
+                  PW="${AD_PASS:-}"
+                  if [ -z "$PW" ]; then read -rsp "Password de $JOIN_USER@$DOMAIN: " PW; echo; fi
+                  printf '%s' "$PW" | realm join --membership-software=samba -U "$JOIN_USER" --computer-ou="OU=$DEPT,$BASE_DN" "$DOMAIN"
+                  unset PW
+                fi
+
+                echo "[5/6] Acceso: solo GG_$DEPT y GG_IT"
+                pam-auth-update --enable mkhomedir
+                realm deny --all
+                ALLOW="GG_${DEPT}@${DOMAIN}"
+                if [ "$DEPT" != "IT" ]; then ALLOW="$ALLOW GG_IT@${DOMAIN}"; fi
+                # shellcheck disable=SC2086
+                realm permit -g $ALLOW
+
+                GID_IT=$(getent group "gg_it@${DOMAIN}" | cut -d: -f3 || true)
+                if [ -n "$GID_IT" ]; then
+                  echo "%#${GID_IT} ALL=(ALL) ALL" > /etc/sudoers.d/gg-it
+                  chmod 440 /etc/sudoers.d/gg-it
+                  visudo -cf /etc/sudoers.d/gg-it
+                else
+                  echo "AVISO: no resolvi GG_IT, sudo para IT no configurado"
+                fi
+
+                echo "[6/6] Resumen"
+                realm list | head -12
+                getent group "gg_${DL}@${DOMAIN}" || echo "AVISO: no resolvi GG_$DEPT"
+                SCRIPT_EOF
+                chmod +x /usr/local/bin/dept-config.sh
+                bash -n /usr/local/bin/dept-config.sh
+
+              - "echo IT > /etc/lab-dept\ntouch /var/lib/clone-ready\n"
+
+  ClientVentas:
+    Type: AWS::EC2::Instance
+    Condition: CreateClients
+    DependsOn: [PrivateDefaultRoute, PrivateSubnetRouteTableAssociation]
+    Properties:
+      InstanceType: !Ref ClientInstanceType
+      ImageId: !Ref ClientAmiId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref PrivateSubnet
+      PrivateIpAddress: !Ref VentasClientIp
+      SecurityGroupIds:
+        - !Ref PrivateSecurityGroup
+      CreditSpecification:
+        CPUCredits: unlimited
+      Tags:
+        - Key: Name
+          Value: ubu-ventas-01
+        - Key: Dept
+          Value: Ventas
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - ""
+            - - |
+                #!/bin/bash
+                exec > /var/log/user-data.log 2>&1
+                set -x
+                export DEBIAN_FRONTEND=noninteractive
+                for i in $(seq 1 30); do apt-get update -y && break; sleep 10; done
+                apt-get install -y realmd sssd sssd-tools sssd-ad adcli krb5-user samba samba-common-bin \
+                  oddjob oddjob-mkhomedir packagekit libnss-sss libpam-sss chrony dnsutils ldap-utils \
+                  smbclient cifs-utils netcat-openbsd
+                systemctl disable --now smbd nmbd || true
+                cat > /usr/local/bin/dept-config.sh << 'SCRIPT_EOF'
+                #!/bin/bash
+                # dept-config.sh v3 - Configura un clon por departamento y lo une a corp.wonderland.local
+                # Uso: sudo dept-config.sh [IT|Ventas|RRHH|Gerencia]
+                #   sin argumento: lee /etc/lab-dept, y si no existe, el tag Dept de IMDS
+                set -euo pipefail
+
+                DOMAIN="corp.wonderland.local"
+                BASE_DN="DC=corp,DC=wonderland,DC=local"
+                DC_IP="192.168.50.10"
+                JOIN_USER="${JOIN_USER:-Administrator}"
+
+                [ "$(id -u)" -eq 0 ] || { echo "Ejecutar con sudo"; exit 1; }
+
+                DEPT="${1:-}"
+                [ -z "$DEPT" ] && [ -s /etc/lab-dept ] && DEPT=$(cat /etc/lab-dept)
+                if [ -z "$DEPT" ]; then
+                  TOKEN=$(curl -s -m 5 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
+                  DEPT=$(curl -s -m 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Dept || true)
+                fi
+                case "$DEPT" in
+                  IT|Ventas|RRHH|Gerencia) ;;
+                  *) echo "Uso: sudo dept-config.sh <IT|Ventas|RRHH|Gerencia>"; exit 1 ;;
+                esac
+                DL="${DEPT,,}"
+                SHORT="ubu-${DL}-01"
+                FQDN="${SHORT}.${DOMAIN}"
+
+                echo "[1/6] Hostname: $FQDN"
+                hostnamectl set-hostname "$FQDN"
+                echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+                IP=$(hostname -I | awk '{print $1}')
+                sed -i "/ ${SHORT}\$/d" /etc/hosts
+                echo "$IP $FQDN $SHORT" >> /etc/hosts
+
+                echo "[2/6] DNS: solo el DC ($DC_IP); el resolver de la VPC no conoce el dominio"
+                IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+                cat > /etc/netplan/60-ad-dns.yaml << NETEOF
+                network:
+                  version: 2
+                  ethernets:
+                    $IFACE:
+                      dhcp4-overrides:
+                        use-dns: false
+                      nameservers:
+                        addresses: [$DC_IP]
+                        search: [$DOMAIN]
+                NETEOF
+                chmod 600 /etc/netplan/60-ad-dns.yaml
+                netplan generate || { rm -f /etc/netplan/60-ad-dns.yaml; echo "netplan invalido, archivo removido"; exit 1; }
+                resolvectl dns "$IFACE" "$DC_IP"
+                resolvectl domain "$IFACE" "$DOMAIN"
+
+                echo "[3/6] Descubrimiento del DC"
+                getent hosts "win-dc01.$DOMAIN" > /dev/null || { echo "No resuelve el DC por DNS (tunel caido o DC apagado?)"; exit 1; }
+                realm discover "$DOMAIN" | head -3
+
+                echo "[4/6] Join al dominio en OU=$DEPT (membresia Samba)"
+                if realm list 2>/dev/null | grep -q "domain-name: $DOMAIN"; then
+                  echo "Ya unido, se omite el join"
+                else
+                  PW="${AD_PASS:-}"
+                  if [ -z "$PW" ]; then read -rsp "Password de $JOIN_USER@$DOMAIN: " PW; echo; fi
+                  printf '%s' "$PW" | realm join --membership-software=samba -U "$JOIN_USER" --computer-ou="OU=$DEPT,$BASE_DN" "$DOMAIN"
+                  unset PW
+                fi
+
+                echo "[5/6] Acceso: solo GG_$DEPT y GG_IT"
+                pam-auth-update --enable mkhomedir
+                realm deny --all
+                ALLOW="GG_${DEPT}@${DOMAIN}"
+                if [ "$DEPT" != "IT" ]; then ALLOW="$ALLOW GG_IT@${DOMAIN}"; fi
+                # shellcheck disable=SC2086
+                realm permit -g $ALLOW
+
+                GID_IT=$(getent group "gg_it@${DOMAIN}" | cut -d: -f3 || true)
+                if [ -n "$GID_IT" ]; then
+                  echo "%#${GID_IT} ALL=(ALL) ALL" > /etc/sudoers.d/gg-it
+                  chmod 440 /etc/sudoers.d/gg-it
+                  visudo -cf /etc/sudoers.d/gg-it
+                else
+                  echo "AVISO: no resolvi GG_IT, sudo para IT no configurado"
+                fi
+
+                echo "[6/6] Resumen"
+                realm list | head -12
+                getent group "gg_${DL}@${DOMAIN}" || echo "AVISO: no resolvi GG_$DEPT"
+                SCRIPT_EOF
+                chmod +x /usr/local/bin/dept-config.sh
+                bash -n /usr/local/bin/dept-config.sh
+
+              - "echo Ventas > /etc/lab-dept\ntouch /var/lib/clone-ready\n"
+
+  ClientRrhh:
+    Type: AWS::EC2::Instance
+    Condition: CreateClients
+    DependsOn: [PrivateDefaultRoute, PrivateSubnetRouteTableAssociation]
+    Properties:
+      InstanceType: !Ref ClientInstanceType
+      ImageId: !Ref ClientAmiId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref PrivateSubnet
+      PrivateIpAddress: !Ref RrhhClientIp
+      SecurityGroupIds:
+        - !Ref PrivateSecurityGroup
+      CreditSpecification:
+        CPUCredits: unlimited
+      Tags:
+        - Key: Name
+          Value: ubu-rrhh-01
+        - Key: Dept
+          Value: RRHH
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - ""
+            - - |
+                #!/bin/bash
+                exec > /var/log/user-data.log 2>&1
+                set -x
+                export DEBIAN_FRONTEND=noninteractive
+                for i in $(seq 1 30); do apt-get update -y && break; sleep 10; done
+                apt-get install -y realmd sssd sssd-tools sssd-ad adcli krb5-user samba samba-common-bin \
+                  oddjob oddjob-mkhomedir packagekit libnss-sss libpam-sss chrony dnsutils ldap-utils \
+                  smbclient cifs-utils netcat-openbsd
+                systemctl disable --now smbd nmbd || true
+                cat > /usr/local/bin/dept-config.sh << 'SCRIPT_EOF'
+                #!/bin/bash
+                # dept-config.sh v3 - Configura un clon por departamento y lo une a corp.wonderland.local
+                # Uso: sudo dept-config.sh [IT|Ventas|RRHH|Gerencia]
+                #   sin argumento: lee /etc/lab-dept, y si no existe, el tag Dept de IMDS
+                set -euo pipefail
+
+                DOMAIN="corp.wonderland.local"
+                BASE_DN="DC=corp,DC=wonderland,DC=local"
+                DC_IP="192.168.50.10"
+                JOIN_USER="${JOIN_USER:-Administrator}"
+
+                [ "$(id -u)" -eq 0 ] || { echo "Ejecutar con sudo"; exit 1; }
+
+                DEPT="${1:-}"
+                [ -z "$DEPT" ] && [ -s /etc/lab-dept ] && DEPT=$(cat /etc/lab-dept)
+                if [ -z "$DEPT" ]; then
+                  TOKEN=$(curl -s -m 5 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
+                  DEPT=$(curl -s -m 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Dept || true)
+                fi
+                case "$DEPT" in
+                  IT|Ventas|RRHH|Gerencia) ;;
+                  *) echo "Uso: sudo dept-config.sh <IT|Ventas|RRHH|Gerencia>"; exit 1 ;;
+                esac
+                DL="${DEPT,,}"
+                SHORT="ubu-${DL}-01"
+                FQDN="${SHORT}.${DOMAIN}"
+
+                echo "[1/6] Hostname: $FQDN"
+                hostnamectl set-hostname "$FQDN"
+                echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+                IP=$(hostname -I | awk '{print $1}')
+                sed -i "/ ${SHORT}\$/d" /etc/hosts
+                echo "$IP $FQDN $SHORT" >> /etc/hosts
+
+                echo "[2/6] DNS: solo el DC ($DC_IP); el resolver de la VPC no conoce el dominio"
+                IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+                cat > /etc/netplan/60-ad-dns.yaml << NETEOF
+                network:
+                  version: 2
+                  ethernets:
+                    $IFACE:
+                      dhcp4-overrides:
+                        use-dns: false
+                      nameservers:
+                        addresses: [$DC_IP]
+                        search: [$DOMAIN]
+                NETEOF
+                chmod 600 /etc/netplan/60-ad-dns.yaml
+                netplan generate || { rm -f /etc/netplan/60-ad-dns.yaml; echo "netplan invalido, archivo removido"; exit 1; }
+                resolvectl dns "$IFACE" "$DC_IP"
+                resolvectl domain "$IFACE" "$DOMAIN"
+
+                echo "[3/6] Descubrimiento del DC"
+                getent hosts "win-dc01.$DOMAIN" > /dev/null || { echo "No resuelve el DC por DNS (tunel caido o DC apagado?)"; exit 1; }
+                realm discover "$DOMAIN" | head -3
+
+                echo "[4/6] Join al dominio en OU=$DEPT (membresia Samba)"
+                if realm list 2>/dev/null | grep -q "domain-name: $DOMAIN"; then
+                  echo "Ya unido, se omite el join"
+                else
+                  PW="${AD_PASS:-}"
+                  if [ -z "$PW" ]; then read -rsp "Password de $JOIN_USER@$DOMAIN: " PW; echo; fi
+                  printf '%s' "$PW" | realm join --membership-software=samba -U "$JOIN_USER" --computer-ou="OU=$DEPT,$BASE_DN" "$DOMAIN"
+                  unset PW
+                fi
+
+                echo "[5/6] Acceso: solo GG_$DEPT y GG_IT"
+                pam-auth-update --enable mkhomedir
+                realm deny --all
+                ALLOW="GG_${DEPT}@${DOMAIN}"
+                if [ "$DEPT" != "IT" ]; then ALLOW="$ALLOW GG_IT@${DOMAIN}"; fi
+                # shellcheck disable=SC2086
+                realm permit -g $ALLOW
+
+                GID_IT=$(getent group "gg_it@${DOMAIN}" | cut -d: -f3 || true)
+                if [ -n "$GID_IT" ]; then
+                  echo "%#${GID_IT} ALL=(ALL) ALL" > /etc/sudoers.d/gg-it
+                  chmod 440 /etc/sudoers.d/gg-it
+                  visudo -cf /etc/sudoers.d/gg-it
+                else
+                  echo "AVISO: no resolvi GG_IT, sudo para IT no configurado"
+                fi
+
+                echo "[6/6] Resumen"
+                realm list | head -12
+                getent group "gg_${DL}@${DOMAIN}" || echo "AVISO: no resolvi GG_$DEPT"
+                SCRIPT_EOF
+                chmod +x /usr/local/bin/dept-config.sh
+                bash -n /usr/local/bin/dept-config.sh
+
+              - "echo RRHH > /etc/lab-dept\ntouch /var/lib/clone-ready\n"
+
+  ClientGerencia:
+    Type: AWS::EC2::Instance
+    Condition: CreateClients
+    DependsOn: [PrivateDefaultRoute, PrivateSubnetRouteTableAssociation]
+    Properties:
+      InstanceType: !Ref ClientInstanceType
+      ImageId: !Ref ClientAmiId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref PrivateSubnet
+      PrivateIpAddress: !Ref GerenciaClientIp
+      SecurityGroupIds:
+        - !Ref PrivateSecurityGroup
+      CreditSpecification:
+        CPUCredits: unlimited
+      Tags:
+        - Key: Name
+          Value: ubu-gerencia-01
+        - Key: Dept
+          Value: Gerencia
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+            - ""
+            - - |
+                #!/bin/bash
+                exec > /var/log/user-data.log 2>&1
+                set -x
+                export DEBIAN_FRONTEND=noninteractive
+                for i in $(seq 1 30); do apt-get update -y && break; sleep 10; done
+                apt-get install -y realmd sssd sssd-tools sssd-ad adcli krb5-user samba samba-common-bin \
+                  oddjob oddjob-mkhomedir packagekit libnss-sss libpam-sss chrony dnsutils ldap-utils \
+                  smbclient cifs-utils netcat-openbsd
+                systemctl disable --now smbd nmbd || true
+                cat > /usr/local/bin/dept-config.sh << 'SCRIPT_EOF'
+                #!/bin/bash
+                # dept-config.sh v3 - Configura un clon por departamento y lo une a corp.wonderland.local
+                # Uso: sudo dept-config.sh [IT|Ventas|RRHH|Gerencia]
+                #   sin argumento: lee /etc/lab-dept, y si no existe, el tag Dept de IMDS
+                set -euo pipefail
+
+                DOMAIN="corp.wonderland.local"
+                BASE_DN="DC=corp,DC=wonderland,DC=local"
+                DC_IP="192.168.50.10"
+                JOIN_USER="${JOIN_USER:-Administrator}"
+
+                [ "$(id -u)" -eq 0 ] || { echo "Ejecutar con sudo"; exit 1; }
+
+                DEPT="${1:-}"
+                [ -z "$DEPT" ] && [ -s /etc/lab-dept ] && DEPT=$(cat /etc/lab-dept)
+                if [ -z "$DEPT" ]; then
+                  TOKEN=$(curl -s -m 5 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60" || true)
+                  DEPT=$(curl -s -m 5 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Dept || true)
+                fi
+                case "$DEPT" in
+                  IT|Ventas|RRHH|Gerencia) ;;
+                  *) echo "Uso: sudo dept-config.sh <IT|Ventas|RRHH|Gerencia>"; exit 1 ;;
+                esac
+                DL="${DEPT,,}"
+                SHORT="ubu-${DL}-01"
+                FQDN="${SHORT}.${DOMAIN}"
+
+                echo "[1/6] Hostname: $FQDN"
+                hostnamectl set-hostname "$FQDN"
+                echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+                IP=$(hostname -I | awk '{print $1}')
+                sed -i "/ ${SHORT}\$/d" /etc/hosts
+                echo "$IP $FQDN $SHORT" >> /etc/hosts
+
+                echo "[2/6] DNS: solo el DC ($DC_IP); el resolver de la VPC no conoce el dominio"
+                IFACE=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+                cat > /etc/netplan/60-ad-dns.yaml << NETEOF
+                network:
+                  version: 2
+                  ethernets:
+                    $IFACE:
+                      dhcp4-overrides:
+                        use-dns: false
+                      nameservers:
+                        addresses: [$DC_IP]
+                        search: [$DOMAIN]
+                NETEOF
+                chmod 600 /etc/netplan/60-ad-dns.yaml
+                netplan generate || { rm -f /etc/netplan/60-ad-dns.yaml; echo "netplan invalido, archivo removido"; exit 1; }
+                resolvectl dns "$IFACE" "$DC_IP"
+                resolvectl domain "$IFACE" "$DOMAIN"
+
+                echo "[3/6] Descubrimiento del DC"
+                getent hosts "win-dc01.$DOMAIN" > /dev/null || { echo "No resuelve el DC por DNS (tunel caido o DC apagado?)"; exit 1; }
+                realm discover "$DOMAIN" | head -3
+
+                echo "[4/6] Join al dominio en OU=$DEPT (membresia Samba)"
+                if realm list 2>/dev/null | grep -q "domain-name: $DOMAIN"; then
+                  echo "Ya unido, se omite el join"
+                else
+                  PW="${AD_PASS:-}"
+                  if [ -z "$PW" ]; then read -rsp "Password de $JOIN_USER@$DOMAIN: " PW; echo; fi
+                  printf '%s' "$PW" | realm join --membership-software=samba -U "$JOIN_USER" --computer-ou="OU=$DEPT,$BASE_DN" "$DOMAIN"
+                  unset PW
+                fi
+
+                echo "[5/6] Acceso: solo GG_$DEPT y GG_IT"
+                pam-auth-update --enable mkhomedir
+                realm deny --all
+                ALLOW="GG_${DEPT}@${DOMAIN}"
+                if [ "$DEPT" != "IT" ]; then ALLOW="$ALLOW GG_IT@${DOMAIN}"; fi
+                # shellcheck disable=SC2086
+                realm permit -g $ALLOW
+
+                GID_IT=$(getent group "gg_it@${DOMAIN}" | cut -d: -f3 || true)
+                if [ -n "$GID_IT" ]; then
+                  echo "%#${GID_IT} ALL=(ALL) ALL" > /etc/sudoers.d/gg-it
+                  chmod 440 /etc/sudoers.d/gg-it
+                  visudo -cf /etc/sudoers.d/gg-it
+                else
+                  echo "AVISO: no resolvi GG_IT, sudo para IT no configurado"
+                fi
+
+                echo "[6/6] Resumen"
+                realm list | head -12
+                getent group "gg_${DL}@${DOMAIN}" || echo "AVISO: no resolvi GG_$DEPT"
+                SCRIPT_EOF
+                chmod +x /usr/local/bin/dept-config.sh
+                bash -n /usr/local/bin/dept-config.sh
+
+              - "echo Gerencia > /etc/lab-dept\ntouch /var/lib/clone-ready\n"
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: hybrid-ad-lab-vpc-id }
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+    Export: { Name: hybrid-ad-lab-public-subnet-id }
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
+    Export: { Name: hybrid-ad-lab-private-subnet-id }
+  GatewayWanPublicIp:
+    Description: IP publica fija del gateway - Endpoint del peer en Wonderland
+    Value: !Ref GatewayWanEip
+  GatewayInstanceId:
+    Value: !Ref GatewayInstance
+  PrivateSecurityGroupId:
+    Description: SG a asignar a las instancias Ubuntu cliente
+    Value: !Ref PrivateSecurityGroup
+  WgServerPublicKeyNote:
+    Value: >-
+      La clave publica del server nace en el primer boot, no esta disponible
+      como Output. Obtenerla por SSM en el gateway con:
+      sudo cat /etc/wireguard/server_public.key
+      Con ese valor armar el [Peer] de Wonderland (wg-hybrid.conf).
+  ClientsDeployed:
+    Value: !Ref DeployClients
+  PostDeployNote:
+    Value: >-
+      1) Asignar LabInstanceProfile al gateway y a cada cliente (Modify IAM role) y reiniciar.
+      2) Levantar wg-hybrid en Wonderland y arrancar win-dc01.
+      3) En cada cliente (SSM), cuando exista /var/lib/clone-ready:
+      sudo dept-config.sh (lee /etc/lab-dept).
