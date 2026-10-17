@@ -71,6 +71,14 @@ Simula una empresa pequeña con oficina on-premise y una sucursal en la nube:
 
 **Tráfico simulado.** Autenticaciones Kerberos, consultas DNS SRV, LDAP y SMB desde los clientes y desde el DC, capturadas sobre el túnel con `tcpdump`.
 
+## Alcance: sandbox AWS Academy vs. cuenta propia
+
+El proyecto se desarrolló sobre un AWS Academy Learner Lab, y eso explica varias decisiones del template (`ExistingInstanceProfileName` vacío, los 4 clientes reinstalando paquetes vía `UserData` en vez de partir de una AMI propia, la limpieza automática de recursos al cerrar el sandbox). Ninguna es una limitación del diseño.
+
+Si lo replicás desde una cuenta AWS normal, dos cosas cambian de verdad: el rol IAM del gateway deja de ser un checklist manual (acá, a diferencia de PentestLab, sí hace falta crearlo para el primer deploy — no hay otro canal de acceso antes de que el túnel esté arriba), y podés lanzar los 4 clientes desde una AMI propia en vez de instalar los paquetes 4 veces. También cambia el panorama de costos — y la Elastic IP del gateway, a diferencia de la IP automática de PentestLab, sigue facturando aunque solo detengas la instancia.
+
+Detalle completo en [`aws-academy-sandbox-vs-cuenta-personal.md`](./aws-academy-sandbox-vs-cuenta-personal.md).
+
 ## Tickets N1
 
 | # | Ticket | Diagnóstico | Resolución |
@@ -116,6 +124,7 @@ Opcional a futuro: un segundo bosque con *forest trust* para simular una fusión
 Active-Directory-Hibrido/
 ├── README.md
 ├── ad-hybrid-lab-documento-v1.md
+├── aws-academy-sandbox-vs-cuenta-personal.md
 ├── hybrid-ad-lab-network.yaml
 └── 01-diagrama-arquitectura.jpg
 ```
@@ -123,6 +132,7 @@ Active-Directory-Hibrido/
 | Archivo | Contenido |
 |---|---|
 | [`ad-hybrid-lab-documento-v1.md`](./ad-hybrid-lab-documento-v1.md) | Bitácora completa: decisiones, comandos exactos, 30 errores con causa raíz, scripts, tickets N1 y pasos para reconstruir |
+| [`aws-academy-sandbox-vs-cuenta-personal.md`](./aws-academy-sandbox-vs-cuenta-personal.md) | Equivalencias IAM, AMI propia, limpieza manual y costos al replicar desde una cuenta AWS normal |
 | [`hybrid-ad-lab-network.yaml`](./hybrid-ad-lab-network.yaml) | Plantilla de CloudFormation: red, gateway WireGuard y, opcionalmente, los 4 clientes Ubuntu |
 | `01-diagrama-arquitectura.jpg` | Diagrama de arquitectura |
 
@@ -137,7 +147,7 @@ Requisitos: un host Linux con KVM/libvirt y WireGuard, una ISO de Windows Server
 5. Actualizar el stack con `DeployClients=true` para lanzar los 4 clientes.
 6. En cada cliente, ejecutar `sudo dept-config.sh` para unirlo al dominio en su OU, y configurar Samba.
 
-Nota para quien use el AWS Learner Lab: CloudFormation no tiene `iam:PassRole`, así que el perfil de instancia se asigna a mano a cada instancia (EC2 > Actions > Security > Modify IAM role) y se reinicia. El detalle paso a paso está en el documento, Anexo E.4.
+Nota para quien use el AWS Learner Lab: CloudFormation no tiene `iam:PassRole`, así que el perfil de instancia se asigna a mano a cada instancia (EC2 > Actions > Security > Modify IAM role) y se reinicia. El detalle paso a paso está en el documento, Anexo E.4. Si replicás desde una cuenta AWS normal en vez del sandbox, ver [`aws-academy-sandbox-vs-cuenta-personal.md`](./aws-academy-sandbox-vs-cuenta-personal.md).
 
 ## Seguridad
 
